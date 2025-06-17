@@ -1,0 +1,162 @@
+<%!-- OEE Dashboard Template --%>
+<div class="container mx-auto p-4">
+  <%!-- Scope Selection --%>
+  <div class="mb-8">
+    <div class="flex flex-wrap justify-between items-center mb-4">
+      <div class="flex flex-wrap gap-4">
+        <button
+          :for={scope <- [:plant, :area, :line, :machine]}
+          class={"btn #{if @selected_scope == scope, do: "btn-primary", else: "btn-outline"}"}
+          phx-click="select_scope"
+          phx-value-scope={scope}
+        >
+          <%= String.capitalize(to_string(scope)) %>
+        </button>
+      </div>
+
+      <%!-- Time Range Selection --%>
+      <div class="flex flex-wrap gap-4">
+        <select class="select select-bordered w-full max-w-xs" phx-change="change_date_range">
+          <option value="last_1h" selected={@date_range == :last_1h}>Last Hour</option>
+          <option value="last_4h" selected={@date_range == :last_4h}>Last 4 Hours</option>
+          <option value="last_8h" selected={@date_range == :last_8h}>Last 8 Hours</option>
+          <option value="last_12h" selected={@date_range == :last_12h}>Last 12 Hours</option>
+          <option value="last_24h" selected={@date_range == :last_24h}>Last 24 Hours</option>
+          <option value="last_7d" selected={@date_range == :last_7d}>Last 7 Days</option>
+          <option value="last_30d" selected={@date_range == :last_30d}>Last 30 Days</option>
+        </select>
+
+        <select class="select select-bordered w-full max-w-xs" phx-change="change_chart_type">
+          <option value="line" selected={@chart_type == :line}>Line Chart</option>
+          <option value="bar" selected={@chart_type == :bar}>Bar Chart</option>
+        </select>
+      </div>
+    </div>
+
+    <%!-- Item Selection Based on Scope --%>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+      <%= case @selected_scope do %>
+        <% :plant -> %>
+          <div
+            :for={plant <- @plants}
+            class={"card cursor-pointer hover:shadow-lg transition-shadow #{if @selected_id == plant.id, do: "border-primary border-2", else: "border"}"}
+            phx-click="select_item"
+            phx-value-id={plant.id}
+          >
+            <div class="card-body">
+              <h3 class="card-title"><%= plant.name %></h3>
+              <p class="text-sm opacity-70"><%= plant.code %></p>
+            </div>
+          </div>
+
+        <% :area -> %>
+          <div
+            :for={area <- @areas}
+            class={"card cursor-pointer hover:shadow-lg transition-shadow #{if @selected_id == area.id, do: "border-primary border-2", else: "border"}"}
+            phx-click="select_item"
+            phx-value-id={area.id}
+          >
+            <div class="card-body">
+              <h3 class="card-title"><%= area.name %></h3>
+              <p class="text-sm opacity-70"><%= area.code %></p>
+            </div>
+          </div>
+
+        <% :line -> %>
+          <div
+            :for={line <- @lines}
+            class={"card cursor-pointer hover:shadow-lg transition-shadow #{if @selected_id == line.id, do: "border-primary border-2", else: "border"}"}
+            phx-click="select_item"
+            phx-value-id={line.id}
+          >
+            <div class="card-body">
+              <h3 class="card-title"><%= line.name %></h3>
+              <p class="text-sm opacity-70"><%= line.code %></p>
+            </div>
+          </div>
+
+        <% :machine -> %>
+          <div
+            :for={machine <- @machines}
+            class={"card cursor-pointer hover:shadow-lg transition-shadow #{if @selected_id == machine.id, do: "border-primary border-2", else: "border"}"}
+            phx-click="select_item"
+            phx-value-id={machine.id}
+          >
+            <div class="card-body">
+              <h3 class="card-title"><%= machine.name %></h3>
+              <p class="text-sm opacity-70"><%= machine.code %></p>
+            </div>
+          </div>
+      <% end %>
+    </div>
+  </div>
+
+  <%!-- Metrics Display --%>
+  <%= if @selected_id do %>
+    <%= if @error do %>
+      <div class="alert alert-error mb-8">
+        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+        <span>Error: <%= @error %></span>
+      </div>
+    <% end %>
+
+    <div class="mb-8 relative">
+      <%= if @loading do %>
+        <div class="absolute inset-0 bg-base-200 bg-opacity-75 flex items-center justify-center z-10">
+          <div class="loading loading-spinner loading-lg text-primary"></div>
+        </div>
+      <% end %>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <%!-- OEE Card --%>
+        <div class="card bg-base-200">
+          <div class="card-body">
+            <h3 class="card-title text-center">OEE</h3>
+            <p class="text-4xl font-bold text-center text-primary"><%= Float.round(@metrics[:oee] || 0, 1) %>%</p>
+            <p class="text-sm text-center opacity-70">Overall Equipment Effectiveness</p>
+          </div>
+        </div>
+
+        <%!-- Availability Card --%>
+        <div class="card bg-base-200">
+          <div class="card-body">
+            <h3 class="card-title text-center">Availability</h3>
+            <p class="text-4xl font-bold text-center text-secondary"><%= Float.round(@metrics[:availability] || 0, 1) %>%</p>
+            <p class="text-sm text-center opacity-70">Uptime vs Planned Production Time</p>
+          </div>
+        </div>
+
+        <%!-- Performance Card --%>
+        <div class="card bg-base-200">
+          <div class="card-body">
+            <h3 class="card-title text-center">Performance</h3>
+            <p class="text-4xl font-bold text-center text-accent"><%= Float.round(@metrics[:performance] || 0, 1) %>%</p>
+            <p class="text-sm text-center opacity-70">Actual vs Ideal Production Rate</p>
+          </div>
+        </div>
+
+        <%!-- Quality Card --%>
+        <div class="card bg-base-200">
+          <div class="card-body">
+            <h3 class="card-title text-center">Quality</h3>
+            <p class="text-4xl font-bold text-center text-info"><%= Float.round(@metrics[:quality] || 0, 1) %>%</p>
+            <p class="text-sm text-center opacity-70">Good Parts vs Total Production</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <%!-- Chart Display --%>
+    <div class="card bg-base-200 p-4">
+      <canvas
+        id="oeeChart"
+        class="w-full h-[400px]"
+        phx-hook="OEEChart"
+        data-intervals={Jason.encode!(@intervals)}
+        data-type={@chart_type}
+      ></canvas>
+    </div>
+  <% end %>
+</div>

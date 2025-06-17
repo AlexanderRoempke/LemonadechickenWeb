@@ -1,0 +1,2441 @@
+
+Create: CLAUDE.md
+
+1    |<-- usage-rules-start -->
+2    |<-- ash_ai-start -->
+3    |## ash_ai usage
+4    |# Rules for working with Ash AI
+5    |
+6    |## Understanding Ash AI
+7    |
+8    |Ash AI is an extension for the Ash framework that integrates AI capabilities with Ash resources. It provides tools for vectorization, embedding generation, LLM interaction, and tooling for AI models.
+9    |
+10   |## Core Concepts
+11   |
+12   |- **Vectorization**: Convert text attributes into vector embeddings for semantic search
+13   |- **AI Tools**: Expose Ash actions as tools for LLMs
+14   |- **Prompt-backed Actions**: Create actions where the implementation is handled by an LLM
+15   |- **MCP Server**: Expose your tools to Machine Context Protocol clients
+16   |
+17   |## Vectorization
+18   |
+19   |Vectorization allows you to convert text data into embeddings that can be used for semantic search.
+20   |
+21   |### Setting Up Vectorization
+22   |
+23   |Add vectorization to a resource by including the `AshAi` extension and defining a vectorize block:
+24   |
+25   |```elixir
+26   |defmodule MyApp.Artist do
+27   |  use Ash.Resource, extensions: [AshAi]
+28   |
+29   |  vectorize do
+30   |    # For creating a single vector from multiple attributes
+31   |    full_text do
+32   |      text(fn record ->
+33   |        """
+34   |        Name: #{record.name}
+35   |        Biography: #{record.biography}
+36   |        """
+37   |      end)
+38   |
+39   |      # Optional - only rebuild embeddings when these attributes change
+40   |      used_attributes [:name, :biography]
+41   |    end
+42   |
+43   |    # Choose a strategy for updating embeddings
+44   |    strategy :ash_oban
+45   |
+46   |    # Specify your embedding model implementation
+47   |    embedding_model MyApp.OpenAiEmbeddingModel
+48   |  end
+49   |
+50   |  # Rest of resource definition...
+51   |end
+52   |```
+53   |
+54   |### Embedding Models
+55   |
+56   |Create a module that implements the `AshAi.EmbeddingModel` behaviour to generate embeddings:
+57   |
+58   |```elixir
+59   |defmodule MyApp.OpenAiEmbeddingModel do
+60   |  use AshAi.EmbeddingModel
+61   |
+62   |  @impl true
+63   |  def dimensions(_opts), do: 3072
+64   |
+65   |  @impl true
+66   |  def generate(texts, _opts) do
+67   |    api_key = System.fetch_env!("OPEN_AI_API_KEY")
+68   |
+69   |    headers = [
+70   |      {"Authorization", "Bearer #{api_key}"},
+71   |      {"Content-Type", "application/json"}
+72   |    ]
+73   |
+74   |    body = %{
+75   |      "input" => texts,
+76   |      "model" => "text-embedding-3-large"
+77   |    }
+78   |
+79   |    response =
+80   |      Req.post!("https://api.openai.com/v1/embeddings",
+81   |        json: body,
+82   |        headers: headers
+83   |      )
+84   |
+85   |    case response.status do
+86   |      200 ->
+87   |        response.body["data"]
+88   |        |> Enum.map(fn %{"embedding" => embedding} -> embedding end)
+89   |        |> then(&{:ok, &1})
+90   |
+91   |      _status ->
+92   |        {:error, response.body}
+93   |    end
+94   |  end
+95   |end
+96   |```
+97   |
+98   |### Vectorization Strategies
+99   |
+100  |Choose the appropriate strategy based on your performance requirements:
+101  |
+102  |1. **`:after_action`** (default): Updates embeddings synchronously after each create and update action
+103  |   - Simple but can make your app slow
+104  |   - Not recommended for production use with many records
+105  |
+106  |2. **`:ash_oban`**: Updates embeddings asynchronously using Ash Oban
+107  |   - Requires `ash_oban` extension
+108  |   - Better for production use
+109  |
+110  |3. **`:manual`**: No automatic updates; you control when embeddings are updated
+111  |   - Most flexible but requires you to manage when to update embeddings
+112  |
+113  |### Using the Vectors for Search
+114  |
+115  |Use vector expressions in filters and sorts:
+116  |
+117  |```elixir
+118  |read :semantic_search do
+119  |  argument :query, :string, allow_nil?: false
+120  |
+121  |  prepare before_action(fn query, context ->
+122  |    case MyApp.OpenAiEmbeddingModel.generate([query.arguments.query], []) do
+123  |      {:ok, [search_vector]} ->
+124  |        Ash.Query.filter(
+125  |          query,
+126  |          vector_cosine_distance(full_text_vector, ^search_vector) < 0.5
+127  |        )
+128  |        |> Ash.Query.sort(asc: vector_cosine_distance(full_text_vector, ^search_vector))
+129  |
+130  |      {:error, error} ->
+131  |        {:error, error}
+132  |    end
+133  |  end)
+134  |end
+135  |```
+136  |
+137  |### Authorization for Vectorization
+138  |
+139  |If you're using policies, add a bypass to allow embedding updates:
+140  |
+141  |```elixir
+142  |bypass action(:ash_ai_update_embeddings) do
+143  |  authorize_if AshAi.Checks.ActorIsAshAi
+144  |end
+145  |```
+146  |
+147  |## AI Tools
+148  |
+149  |Expose your Ash actions as tools for LLMs to use by configuring them in your domain:
+150  |
+151  |```elixir
+152  |defmodule MyApp.Blog do
+153  |  use Ash.Domain, extensions: [AshAi]
+154  |
+155  |  tools do
+156  |    tool :read_posts, MyApp.Blog.Post, :read do
+157  |      description "customize the tool description"
+158  |    end
+159  |    tool :create_post, MyApp.Blog.Post, :create
+160  |    tool :publish_post, MyApp.Blog.Post, :publish
+161  |    tool :read_comments, MyApp.Blog.Comment, :read
+162  |  end
+163  |
+164  |  # Rest of domain definition...
+165  |end
+166  |```
+167  |
+168  |### Using Tools in LangChain
+169  |
+170  |Add your Ash AI tools to a LangChain chain:
+171  |
+172  |```elixir
+173  |chain =
+174  |  %{
+175  |    llm: LangChain.ChatModels.ChatOpenAI.new!(%{model: "gpt-4o"}),
+176  |    verbose: true
+177  |  }
+178  |  |> LangChain.Chains.LLMChain.new!()
+179  |  |> AshAi.setup_ash_ai(otp_app: :my_app, tools: [:list, :of, :tools])
+180  |```
+181  |
+182  |## Structured Outputs (Prompt-Backed Actions)
+183  |
+184  |Create actions that use LLMs for their implementation:
+185  |
+186  |```elixir
+187  |action :analyze_sentiment, :atom do
+188  |  constraints one_of: [:positive, :negative]
+189  |
+190  |  description """
+191  |  Analyzes the sentiment of a given piece of text to determine if it is overall positive or negative.
+192  |  """
+193  |
+194  |  argument :text, :string do
+195  |    allow_nil? false
+196  |    description "The text for analysis"
+197  |  end
+198  |
+199  |  run prompt(
+200  |    LangChain.ChatModels.ChatOpenAI.new!(%{model: "gpt-4o"}),
+201  |    # Allow the model to use tools
+202  |    tools: true,
+203  |    # Or restrict to specific tools
+204  |    # tools: [:list, :of, :tool, :names],
+205  |    # Optionally provide a custom prompt template
+206  |    # prompt: "Analyze the sentiment of the following text: <%= @input.arguments.text %>"
+207  |  )
+208  |end
+209  |```
+210  |
+211  |### Dynamic LLM Configuration
+212  |
+213  |For runtime configuration (like environment variables), use a function to define the LLM:
+214  |
+215  |```elixir
+216  |action :analyze_sentiment, :atom do
+217  |  argument :text, :string, allow_nil?: false
+218  |  
+219  |  run prompt(
+220  |    fn _input, _context -> 
+221  |      LangChain.ChatModels.ChatOpenAI.new!(%{
+222  |        model: "gpt-4o",
+223  |        # this can also be configured in application config, see langchain docs for more.
+224  |        api_key: System.get_env("OPENAI_API_KEY"),
+225  |        endpoint: System.get_env("OPENAI_ENDPOINT")
+226  |      })
+227  |    end,
+228  |    tools: false
+229  |  )
+230  |end
+231  |```
+232  |
+233  |The function receives:
+234  |1. `input` - The action input
+235  |2. `context` - The execution context
+236  |
+237  |### Best Practices for Prompt-Backed Actions
+238  |
+239  |- Write clear, detailed descriptions for the action and its arguments
+240  |- Use constraints when appropriate to restrict outputs
+241  |- Consider providing a custom prompt for more complex tasks
+242  |- Test thoroughly with different inputs to ensure reliable results
+243  |
+244  |## Model Context Protocol (MCP) Server
+245  |
+246  |### Development MCP Server
+247  |
+248  |For development environments, add the dev MCP server to your Phoenix endpoint:
+249  |
+250  |```elixir
+251  |if code_reloading? do
+252  |  socket "/phoenix/live_reload/socket", Phoenix.LiveReloader.Socket
+253  |
+254  |  plug AshAi.Mcp.Dev,
+255  |    protocol_version_statement: "2024-11-05",
+256  |    otp_app: :your_app
+257  |
+258  |  plug Phoenix.LiveReloader
+259  |  plug Phoenix.CodeReloader
+260  |end
+261  |```
+262  |
+263  |### Production MCP Server
+264  |
+265  |For production environments, set up authentication and add the MCP router:
+266  |
+267  |```elixir
+268  |# Add api_key strategy to your auth pipeline
+269  |pipeline :mcp do
+270  |  plug AshAuthentication.Strategy.ApiKey.Plug,
+271  |    resource: YourApp.Accounts.User,
+272  |    required?: false  # Set to true if all tools require authentication
+273  |end
+274  |
+275  |# In your router
+276  |scope "/mcp" do
+277  |  pipe_through :mcp
+278  |
+279  |  forward "/", AshAi.Mcp.Router,
+280  |    tools: [
+281  |      # List your tools here
+282  |      :read_posts,
+283  |      :create_post,
+284  |      :analyze_sentiment
+285  |    ],
+286  |    protocol_version_statement: "2024-11-05",
+287  |    otp_app: :my_app
+288  |end
+289  |```
+290  |
+291  |## Testing
+292  |
+293  |When testing AI components:
+294  |- Mock embedding model responses for consistent test results
+295  |- Test vector search with known embeddings
+296  |- For prompt-backed actions, consider using deterministic test models
+297  |- Verify tool access and permissions work as expected
+298  |
+299  |<-- ash_ai-end -->
+300  |<-- ash_json_api-start -->
+301  |## ash_json_api usage
+302  |# Rules for working with AshJsonApi
+303  |
+304  |## Understanding AshJsonApi
+305  |
+306  |AshJsonApi is a package for integrating Ash Framework with the JSON:API specification. It provides tools for generating JSON:API compliant endpoints from your Ash resources. AshJsonApi allows you to expose your Ash resources through a standardized RESTful API, supporting all JSON:API features like filtering, sorting, pagination, includes, and relationships.
+307  |
+308  |## Domain Configuration
+309  |
+310  |AshJsonApi works by extending your Ash domains and resources with JSON:API capabilities. First, add the AshJsonApi extension to your domain.
+311  |
+312  |### Setting Up Your Domain
+313  |
+314  |```elixir
+315  |defmodule MyApp.Blog do
+316  |  use Ash.Domain,
+317  |    extensions: [
+318  |      AshJsonApi.Domain
+319  |    ]
+320  |
+321  |  json_api do
+322  |    # Define JSON:API-specific settings for this domain
+323  |    authorize? true
+324  |
+325  |    # You can define routes at the domain level
+326  |    routes do
+327  |      base_route "/posts", MyApp.Blog.Post do
+328  |        get :read
+329  |        index :read
+330  |        post :create
+331  |        patch :update
+332  |        delete :destroy
+333  |      end
+334  |    end
+335  |  end
+336  |
+337  |  resources do
+338  |    resource MyApp.Blog.Post
+339  |    resource MyApp.Blog.Comment
+340  |  end
+341  |end
+342  |```
+343  |
+344  |## Resource Configuration
+345  |
+346  |Each resource that you want to expose via JSON:API needs to include the AshJsonApi.Resource extension.
+347  |
+348  |### Setting Up Resources
+349  |
+350  |```elixir
+351  |defmodule MyApp.Blog.Post do
+352  |  use Ash.Resource,
+353  |    domain: MyApp.Blog,
+354  |    extensions: [AshJsonApi.Resource]
+355  |
+356  |  attributes do
+357  |    uuid_primary_key :id
+358  |    attribute :title, :string
+359  |    attribute :body, :string
+360  |    attribute :published, :boolean
+361  |  end
+362  |
+363  |  relationships do
+364  |    belongs_to :author, MyApp.Accounts.User
+365  |    has_many :comments, MyApp.Blog.Comment
+366  |  end
+367  |
+368  |  json_api do
+369  |    # The JSON:API type name (required)
+370  |    type "post"
+371  |  end
+372  |
+373  |  actions do
+374  |    defaults [:create, :read, :update, :destroy]
+375  |
+376  |    read :list_published do
+377  |      filter expr(published == true)
+378  |    end
+379  |
+380  |    update :publish do
+381  |      accept []
+382  |      change set_attribute(:published, true)
+383  |    end
+384  |  end
+385  |end
+386  |```
+387  |
+388  |## Route Types
+389  |
+390  |AshJsonApi supports various route types according to the JSON:API spec:
+391  |
+392  |- `get` - Fetch a single resource by ID
+393  |- `index` - List resources, with support for filtering, sorting, and pagination
+394  |- `post` - Create a new resource
+395  |- `patch` - Update an existing resource
+396  |- `delete` - Destroy an existing resource
+397  |- `related` - Fetch related resources (e.g., `/posts/123/comments`)
+398  |- `relationship` - Fetch relationship data (e.g., `/posts/123/relationships/comments`)
+399  |- `post_to_relationship` - Add to a relationship
+400  |- `patch_relationship` - Replace a relationship
+401  |- `delete_from_relationship` - Remove from a relationship
+402  |
+403  |## JSON:API Pagination, Filtering, and Sorting
+404  |
+405  |AshJsonApi supports standard JSON:API query parameters:
+406  |
+407  |- Filter: `?filter[attribute]=value`
+408  |- Sort: `?sort=attribute,-other_attribute` (descending with `-`)
+409  |- Pagination: `?page[number]=2&page[size]=10`
+410  |- Includes: `?include=author,comments.author`
+411  |
+412  |<-- ash_json_api-end -->
+413  |<-- ash-start -->
+414  |## ash usage
+415  |# Rules for working with Ash
+416  |
+417  |## Understanding Ash
+418  |
+419  |Ash is an opinionated, composable framework for building applications in Elixir. It provides a declarative approach to modeling your domain with resources at the center. Read documentation  *before* attempting to use it's features. Do not assume that you have prior knowledge of the framework or its conventions.
+420  |
+421  |## Code Structure & Organization
+422  |
+423  |- Organize code around domains and resources
+424  |- Each resource should be focused and well-named
+425  |- Create domain-specific actions rather than generic CRUD operations
+426  |- Put business logic inside actions rather than in external modules
+427  |- Use resources to model your domain entities
+428  |
+429  |## Code Interfaces
+430  |
+431  |Use code interfaces on domains to define the contract for calling into Ash resources. See the [Code interface guide for more](https://hexdocs.pm/ash/code-interfaces.html).
+432  |
+433  |Define code interfaces on the domain, like this:
+434  |
+435  |```elixir
+436  |resource ResourceName do
+437  |  define :fun_name, action: :action_name
+438  |end
+439  |```
+440  |
+441  |For more complex interfaces with custom transformations:
+442  |
+443  |```elixir
+444  |define :custom_action do
+445  |  action :action_name
+446  |  args [:arg1, :arg2]
+447  |
+448  |  custom_input :arg1, MyType do
+449  |    transform do
+450  |      to :target_field
+451  |      using &MyModule.transform_function/1
+452  |    end
+453  |  end
+454  |end
+455  |```
+456  |
+457  |Prefer using the primary read action for "get" style code interfaces, and using `get_by` when the field you are looking up by is the primary key or has an `identity` on the resource.
+458  |
+459  |```elixir
+460  |resource ResourceName do
+461  |  define :get_thing, action: :read, get_by: [:id]
+462  |end
+463  |```
+464  |
+465  |**Avoid direct Ash calls in web modules** - Don't use `Ash.get!/2` and `Ash.load!/2` directly in LiveViews/Controllers, similar to avoiding `Repo.get/2` outside context modules:
+466  |
+467  |```elixir
+468  |# BAD - in LiveView/Controller
+469  |group = MyApp.Resource |> Ash.get!(id) |> Ash.load!(rel: [:nested])
+470  |
+471  |# GOOD - use code interface with get_by
+472  |resource DashboardGroup do
+473  |  define :get_by_id, action: :read, get_by: [:id]
+474  |end
+475  |
+476  |# Then call:
+477  |MyApp.Domain.get_dashboard_group_by_id!(id, load: [rel: [:nested]])
+478  |```
+479  |
+480  |**Code interface options** - Prefer passing options directly to code interface functions rather than building queries manually:
+481  |
+482  |```elixir
+483  |# PREFERRED - Concise and idiomatic
+484  |posts = MyApp.Blog.list_posts!(
+485  |  filter: [status: :published],
+486  |  load: [author: :profile, comments: [:author]],
+487  |  sort: [published_at: :desc],
+488  |  limit: 10
+489  |)
+490  |
+491  |# Complex scenarios use the query option
+492  |users = MyApp.Accounts.list_users!(
+493  |  query: [filter: [active: true], load: [:profile], sort: [created_at: :desc]]
+494  |)
+495  |
+496  |# AVOID - Verbose manual query building
+497  |query = MyApp.Post |> Ash.Query.filter(...) |> Ash.Query.load(...)
+498  |posts = MyApp.Blog.read!(query)
+499  |```
+500  |
+501  |Supported options: `load:`, `filter:`, `sort:`, `limit:`, `offset:`, `query:`, `page:`, `stream?:`
+502  |
+503  |**Using Scopes in LiveViews** - When using `Ash.Scope`, the scope will typically be assigned to `scope` in LiveViews and used like so:
+504  |
+505  |```elixir
+506  |# In your LiveView
+507  |MyApp.Blog.create_post!("new post", scope: socket.assigns.scope)
+508  |```
+509  |
+510  |Inside action hooks and callbacks, use the provided `context` parameter as your scope instead:
+511  |
+512  |```elixir
+513  ||> Ash.Changeset.before_transaction(fn changeset, context ->
+514  |  MyApp.ExternalService.reserve_inventory(changeset, scope: context)
+515  |  changeset
+516  |end)
+517  |```
+518  |
+519  |### Authorization Functions
+520  |
+521  |For each action defined in a code interface, Ash automatically generates corresponding authorization check functions:
+522  |
+523  |- `can_action_name?(actor, params \\ %{}, opts \\ [])` - Returns `true`/`false` for authorization checks
+524  |- `can_action_name(actor, params \\ %{}, opts \\ [])` - Returns `{:ok, true/false}` or `{:error, reason}`
+525  |
+526  |Example usage:
+527  |```elixir
+528  |# Check if user can create a post
+529  |if MyApp.Blog.can_create_post?(current_user) do
+530  |  # Show create button
+531  |end
+532  |
+533  |# Check if user can update a specific post
+534  |if MyApp.Blog.can_update_post?(current_user, post) do
+535  |  # Show edit button
+536  |end
+537  |
+538  |# Check if user can destroy a specific comment
+539  |if MyApp.Blog.can_destroy_comment?(current_user, comment) do
+540  |  # Show delete button
+541  |end
+542  |```
+543  |
+544  |These functions are particularly useful for conditional rendering of UI elements based on user permissions.
+545  |
+546  |## Actions
+547  |
+548  |- Create specific, well-named actions rather than generic ones
+549  |- Put all business logic inside action definitions
+550  |- Use hooks like `Ash.Changeset.after_action/2`, `Ash.Changeset.before_action/2` to add additional logic
+551  |  inside the same transaction.
+552  |- Use hooks like `Ash.Changeset.after_transaction/2`, `Ash.Changeset.before_transaction/2` to add additional logic
+553  |  outside the transaction.
+554  |- Use action arguments for inputs that need validation
+555  |- Use preparations to modify queries before execution
+556  |- Use changes to modify changesets before execution
+557  |- Use validations to validate changesets before execution
+558  |- Prefer domain code interfaces to call actions instead of directly building queries/changesets and calling functions in the `Ash` module
+559  |- A resource could be *only generic actions*. This can be useful when you are using a resource only to model behavior.
+560  |
+561  |## Querying Data
+562  |
+563  |Use `Ash.Query` to build queries for reading data from your resources. The query module provides a declarative way to filter, sort, and load data.
+564  |
+565  |**Important**: You must `require Ash.Query` if you want to use `Ash.Query.filter/2`, as it is a macro.
+566  |
+567  |```elixir
+568  |defmodule MyApp.SomeModule do
+569  |  require Ash.Query
+570  |
+571  |  def get_active_posts do
+572  |    MyApp.Post
+573  |    |> Ash.Query.filter(status == :active)
+574  |    |> MyApp.Blog.read!()
+575  |  end
+576  |end
+577  |```
+578  |
+579  |Common query operations:
+580  |
+581  |- **Filter**: `Ash.Query.filter(query, field == value)`
+582  |- **Sort**: `Ash.Query.sort(query, field: :asc)`
+583  |- **Load relationships**: `Ash.Query.load(query, [:author, :comments])`
+584  |- **Limit**: `Ash.Query.limit(query, 10)`
+585  |- **Offset**: `Ash.Query.offset(query, 20)`
+586  |
+587  |## Error Handling
+588  |
+589  |Functions to call actions, like `Ash.create` and code interfaces like `MyApp.Accounts.register_user` all return ok/error tuples. All have `!` variations, like `Ash.create!` and `MyApp.Accounts.register_user!`. Use the `!` variations when you want to "let it crash", like if looking something up that should definitely exist, or calling an action that should always succeed. Always prefer the raising `!` variation over something like `{:ok, user} = MyApp.Accounts.register_user(...)`.
+590  |
+591  |All Ash code returns errors in the form of `{:error, error_class}`. Ash categorizes errors into four main classes:
+592  |
+593  |1. **Forbidden** (`Ash.Error.Forbidden`) - Occurs when a user attempts an action they don't have permission to perform
+594  |2. **Invalid** (`Ash.Error.Invalid`) - Occurs when input data doesn't meet validation requirements
+595  |3. **Framework** (`Ash.Error.Framework`) - Occurs when there's an issue with how Ash is being used
+596  |4. **Unknown** (`Ash.Error.Unknown`) - Occurs for unexpected errors that don't fit the other categories
+597  |
+598  |These error classes help you catch and handle errors at an appropriate level of granularity. An error class will always be the "worst" (highest in the above list) error class from above. Each error class can contain multiple underlying errors, accessible via the `errors` field on the exception.
+599  |
+600  |### Using Validations
+601  |
+602  |Validations ensure that data meets your business requirements before it gets processed by an action. Unlike changes, validations cannot modify the changeset - they can only validate it or add errors.
+603  |
+604  |Common validation patterns:
+605  |
+606  |```elixir
+607  |# Built-in validations with custom messages
+608  |validate compare(:age, greater_than_or_equal_to: 18) do
+609  |  message "You must be at least 18 years old"
+610  |end
+611  |validate match(:email, "@")
+612  |validate one_of(:status, [:active, :inactive, :pending])
+613  |
+614  |# Conditional validations
+615  |validate present(:phone_number) do
+616  |  where present(:contact_method) and eq(:contact_method, "phone")
+617  |end
+618  |
+619  |# Action-specific vs global validations
+620  |actions do
+621  |  create :sign_up do
+622  |    validate present([:email, :password])  # Only for this action
+623  |  end
+624  |end
+625  |
+626  |validations do
+627  |  validate present([:title, :body]), on: [:create, :update]  # Multiple actions
+628  |end
+629  |```
+630  |
+631  |- Create **custom validation modules** for complex validation logic:
+632  |  ```elixir
+633  |  defmodule MyApp.Validations.UniqueUsername do
+634  |    use Ash.Resource.Validation
+635  |
+636  |    @impl true
+637  |    def init(opts), do: {:ok, opts}
+638  |
+639  |    @impl true
+640  |    def validate(changeset, _opts, _context) do
+641  |      # Validation logic here
+642  |      # Return :ok or {:error, message}
+643  |    end
+644  |  end
+645  |
+646  |  # Usage in resource:
+647  |  validate {MyApp.Validations.UniqueUsername, []}
+648  |  ```
+649  |
+650  |- Make validations **atomic** when possible to ensure they work correctly with direct database operations by implementing the `atomic/3` callback in custom validation modules.
+651  |
+652  |```elixir
+653  |defmodule MyApp.Validations.IsEven do
+654  |  # transform and validate opts
+655  |
+656  |  use Ash.Resource.Validation
+657  |
+658  |  @impl true
+659  |  def init(opts) do
+660  |    if is_atom(opts[:attribute]) do
+661  |      {:ok, opts}
+662  |    else
+663  |      {:error, "attribute must be an atom!"}
+664  |    end
+665  |  end
+666  |
+667  |  @impl true
+668  |  # This is optional, but useful to have in addition to validation
+669  |  # so you get early feedback for validations that can otherwise
+670  |  # only run in the datalayer
+671  |  def validate(changeset, opts, _context) do
+672  |    value = Ash.Changeset.get_attribute(changeset, opts[:attribute])
+673  |
+674  |    if is_nil(value) || (is_number(value) && rem(value, 2) == 0) do
+675  |      :ok
+676  |    else
+677  |      {:error, field: opts[:attribute], message: "must be an even number"}
+678  |    end
+679  |  end
+680  |
+681  |  @impl true
+682  |  def atomic(changeset, opts, context) do
+683  |    {:atomic,
+684  |      # the list of attributes that are involved in the validation
+685  |      [opts[:attribute]],
+686  |      # the condition that should cause the error
+687  |      # here we refer to the new value or the current value
+688  |      expr(rem(^atomic_ref(opts[:attribute]), 2) != 0),
+689  |      # the error expression
+690  |      expr(
+691  |        error(^InvalidAttribute, %{
+692  |          field: ^opts[:attribute],
+693  |          # the value that caused the error
+694  |          value: ^atomic_ref(opts[:attribute]),
+695  |          # the message to display
+696  |          message: ^(context.message || "%{field} must be an even number"),
+697  |          vars: %{field: ^opts[:attribute]}
+698  |        })
+699  |      )
+700  |    }
+701  |  end
+702  |end
+703  |```
+704  |
+705  |- **Avoid redundant validations** - Don't add validations that duplicate attribute constraints:
+706  |  ```elixir
+707  |  # WRONG - redundant validation
+708  |  attribute :name, :string do
+709  |    allow_nil? false
+710  |    constraints min_length: 1
+711  |  end
+712  |
+713  |  validate present(:name) do  # Redundant! allow_nil? false already handles this
+714  |    message "Name is required"
+715  |  end
+716  |
+717  |  validate attribute_does_not_equal(:name, "") do  # Redundant! min_length: 1 already handles this
+718  |    message "Name cannot be empty"
+719  |  end
+720  |
+721  |  # CORRECT - let attribute constraints handle basic validation
+722  |  attribute :name, :string do
+723  |    allow_nil? false
+724  |    constraints min_length: 1
+725  |  end
+726  |  ```
+727  |
+728  |### Using Changes
+729  |
+730  |Changes allow you to modify the changeset before it gets processed by an action. Unlike validations, changes can manipulate attribute values, add attributes, or perform other data transformations.
+731  |
+732  |Common change patterns:
+733  |
+734  |```elixir
+735  |# Built-in changes with conditions
+736  |change set_attribute(:status, "pending")
+737  |change relate_actor(:creator) do
+738  |  where present(:actor)
+739  |end
+740  |change atomic_update(:counter, expr(^counter + 1))
+741  |
+742  |# Action-specific vs global changes
+743  |actions do
+744  |  create :sign_up do
+745  |    change set_attribute(:joined_at, expr(now()))  # Only for this action
+746  |  end
+747  |end
+748  |
+749  |changes do
+750  |  change set_attribute(:updated_at, expr(now())), on: :update  # Multiple actions
+751  |  change manage_relationship(:items, type: :append), on: [:create, :update]
+752  |end
+753  |```
+754  |
+755  |- Create **custom change modules** for reusable transformation logic:
+756  |  ```elixir
+757  |  defmodule MyApp.Changes.SlugifyTitle do
+758  |    use Ash.Resource.Change
+759  |
+760  |    def change(changeset, _opts, _context) do
+761  |      title = Ash.Changeset.get_attribute(changeset, :title)
+762  |
+763  |      if title do
+764  |        slug = title |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "-")
+765  |        Ash.Changeset.change_attribute(changeset, :slug, slug)
+766  |      else
+767  |        changeset
+768  |      end
+769  |    end
+770  |  end
+771  |
+772  |  # Usage in resource:
+773  |  change {MyApp.Changes.SlugifyTitle, []}
+774  |  ```
+775  |
+776  |- Create a **change module with lifecycle hooks** to handle complex multi-step operations:
+777  |
+778  |```elixir
+779  |defmodule MyApp.Changes.ProcessOrder do
+780  |  use Ash.Resource.Change
+781  |
+782  |  def change(changeset, _opts, context) do
+783  |    changeset
+784  |    |> Ash.Changeset.before_transaction(fn changeset ->
+785  |      # Runs before the transaction starts
+786  |      # Use for external API calls, logging, etc.
+787  |      MyApp.ExternalService.reserve_inventory(changeset, scope: context)
+788  |      changeset
+789  |    end)
+790  |    |> Ash.Changeset.before_action(fn changeset ->
+791  |      # Runs inside the transaction before the main action
+792  |      # Use for related database changes in the same transaction
+793  |      Ash.Changeset.change_attribute(changeset, :processed_at, DateTime.utc_now())
+794  |    end)
+795  |    |> Ash.Changeset.after_action(fn changeset, result ->
+796  |      # Runs inside the transaction after the main action, only on success
+797  |      # Use for related database changes that depend on the result
+798  |      MyApp.Inventory.update_stock_levels(result, scope: context)
+799  |      {changeset, result}
+800  |    end)
+801  |    |> Ash.Changeset.after_transaction(fn changeset,
+802  |      {:ok, result} ->
+803  |        # Runs after the transaction completes (success or failure)
+804  |        # Use for notifications, external systems, etc.
+805  |        MyApp.Mailer.send_order_confirmation(result, scope: context)
+806  |        {changeset, result}
+807  |
+808  |      {:error, error} ->
+809  |        # Runs after the transaction completes (success or failure)
+810  |        # Use for notifications, external systems, etc.
+811  |        MyApp.Mailer.send_order_issue_notice(result, scope: context)
+812  |        {:error, error}
+813  |    end)
+814  |  end
+815  |end
+816  |
+817  |# Usage in resource:
+818  |change {MyApp.Changes.ProcessOrder, []}
+819  |```
+820  |
+821  |## Anonymous Functions
+822  |
+823  |Prefer to put code in its own module and refer to that in changes, preparations, validations etc.
+824  |
+825  |For example, prefer this:
+826  |
+827  |```elixir
+828  |# in
+829  |defmodule MyApp.MyDomain.MyResource.Changes.SlugifyName do
+830  |  use Ash.Resource.Change
+831  |
+832  |  def change(changeset, _, _) do
+833  |    Ash.Changeset.before_action(changeset, fn changeset, _ ->
+834  |      slug = MyApp.Slug.get()
+835  |      Ash.Changeset.force_change_attribute(changeset, :slug, slug)
+836  |    end)
+837  |  end
+838  |end
+839  |
+840  |change MyApp.MyDomain.MyResource.Changes.SlugifyName
+841  |```
+842  |
+843  |### Action Types
+844  |
+845  |- **Read**: For retrieving records
+846  |- **Create**: For creating records
+847  |- **Update**: For changing records
+848  |- **Destroy**: For removing records
+849  |- **Generic**: For custom operations that don't fit the other types
+850  |
+851  |## Relationships
+852  |
+853  |Relationships describe connections between resources and are a core component of Ash. Define relationships in the `relationships` block of a resource.
+854  |
+855  |### Best Practices for Relationships
+856  |
+857  |- Be descriptive with relationship names (e.g., use `:authored_posts` instead of just `:posts`)
+858  |- Configure foreign key constraints in your data layer if they have them (see `references` in AshPostgres)
+859  |- Always choose the appropriate relationship type based on your domain model
+860  |
+861  |#### Relationship Types
+862  |
+863  |```elixir
+864  |relationships do
+865  |  # belongs_to - adds foreign key to source resource
+866  |  belongs_to :owner, MyApp.User do
+867  |    allow_nil? false
+868  |    attribute_type :integer  # defaults to :uuid
+869  |  end
+870  |
+871  |  # has_one - foreign key on destination resource
+872  |  has_one :profile, MyApp.Profile
+873  |
+874  |  # has_many - foreign key on destination resource, returns list
+875  |  has_many :posts, MyApp.Post do
+876  |    filter expr(published == true)
+877  |    sort published_at: :desc
+878  |  end
+879  |
+880  |  # many_to_many - requires join resource
+881  |  many_to_many :tags, MyApp.Tag do
+882  |    through MyApp.PostTag
+883  |    source_attribute_on_join_resource :post_id
+884  |    destination_attribute_on_join_resource :tag_id
+885  |  end
+886  |end
+887  |```
+888  |
+889  |The join resource must be defined separately:
+890  |
+891  |```elixir
+892  |defmodule MyApp.PostTag do
+893  |  use Ash.Resource,
+894  |    data_layer: AshPostgres.DataLayer
+895  |
+896  |  attributes do
+897  |    uuid_primary_key :id
+898  |    # Add additional attributes if you need metadata on the relationship
+899  |    attribute :added_at, :utc_datetime_usec do
+900  |      default &DateTime.utc_now/0
+901  |    end
+902  |  end
+903  |
+904  |  relationships do
+905  |    belongs_to :post, MyApp.Post, primary_key?: true, allow_nil?: false
+906  |    belongs_to :tag, MyApp.Tag, primary_key?: true, allow_nil?: false
+907  |  end
+908  |
+909  |  actions do
+910  |    defaults [:read, :destroy, create: :*, update: :*]
+911  |  end
+912  |end
+913  |```
+914  |
+915  |### Loading Relationships
+916  |
+917  |```elixir
+918  |# Using code interface options (preferred)
+919  |post = MyDomain.get_post!(id, load: [:author, comments: [:author]])
+920  |
+921  |# Complex loading with filters
+922  |posts = MyDomain.list_posts!(
+923  |  query: [load: [comments: [filter: [is_approved: true], limit: 5]]]
+924  |)
+925  |
+926  |# Manual query building (for complex cases)
+927  |MyApp.Post
+928  ||> Ash.Query.load(comments: MyApp.Comment |> Ash.Query.filter(is_approved == true))
+929  ||> Ash.read!()
+930  |
+931  |# Loading on existing records
+932  |Ash.load!(post, :author)
+933  |```
+934  |
+935  |Prefer to use the `strict?` option when loading to only load necessary fields on related data.
+936  |
+937  |```Elixir
+938  |MyApp.Post
+939  ||> Ash.Query.load([comments: [:title]], strict?: true)
+940  |```
+941  |
+942  |### Managing Relationships
+943  |
+944  |There are two primary ways to manage relationships in Ash:
+945  |
+946  |#### 1. Using `change manage_relationship/2-3` in Actions
+947  |Use this when input comes from action arguments:
+948  |
+949  |```elixir
+950  |actions do
+951  |  update :update do
+952  |    # Define argument for the related data
+953  |    argument :comments, {:array, :map} do
+954  |      allow_nil? false
+955  |    end
+956  |
+957  |    argument :new_tags, {:array, :map}
+958  |
+959  |    # Link argument to relationship management
+960  |    change manage_relationship(:comments, type: :append)
+961  |
+962  |    # For different argument and relationship names
+963  |    change manage_relationship(:new_tags, :tags, type: :append)
+964  |  end
+965  |end
+966  |```
+967  |
+968  |#### 2. Using `Ash.Changeset.manage_relationship/3-4` in Custom Changes
+969  |Use this when building values programmatically:
+970  |
+971  |```elixir
+972  |defmodule MyApp.Changes.AssignTeamMembers do
+973  |  use Ash.Resource.Change
+974  |
+975  |  def change(changeset, _opts, context) do
+976  |    members = determine_team_members(changeset, context.actor)
+977  |
+978  |    Ash.Changeset.manage_relationship(
+979  |      changeset,
+980  |      :members,
+981  |      members,
+982  |      type: :append_and_remove
+983  |    )
+984  |  end
+985  |end
+986  |```
+987  |
+988  |#### Quick Reference - Management Types
+989  |- `:append` - Add new related records, ignore existing
+990  |- `:append_and_remove` - Add new related records, remove missing
+991  |- `:remove` - Remove specified related records
+992  |- `:direct_control` - Full CRUD control (create/update/destroy)
+993  |- `:create` - Only create new records
+994  |
+995  |#### Quick Reference - Common Options
+996  |- `on_lookup: :relate` - Look up and relate existing records
+997  |- `on_no_match: :create` - Create if no match found
+998  |- `on_match: :update` - Update existing matches
+999  |- `on_missing: :destroy` - Delete records not in input
+1000 |- `value_is_key: :name` - Use field as key for simple values
+1001 |
+1002 |For comprehensive documentation, see the [Managing Relationships](documentation/topics/resources/relationships.md#managing-relationships) section.
+1003 |
+1004 |#### Examples
+1005 |
+1006 |Creating a post with tags:
+1007 |```elixir
+1008 |MyDomain.create_post!(%{
+1009 |  title: "New Post",
+1010 |  body: "Content here...",
+1011 |  tags: [%{name: "elixir"}, %{name: "ash"}]  # Creates new tags
+1012 |})
+1013 |
+1014 |# Updating a post to replace its tags
+1015 |MyDomain.update_post!(post, %{
+1016 |  tags: [tag1.id, tag2.id]  # Replaces tags with existing ones by ID
+1017 |})
+1018 |```
+1019 |
+1020 |## Generating Code
+1021 |
+1022 |Use `mix ash.gen.*` tasks as a basis for code generation when possible. Check the task docs with `mix help <task>`.
+1023 |Be sure to use `--yes` to bypass confirmation prompts. Use `--yes --dry-run` to preview the changes.
+1024 |
+1025 |## Data Layers
+1026 |
+1027 |Data layers determine how resources are stored and retrieved. Examples of data layers:
+1028 |
+1029 |- **Postgres**: For storing resources in PostgreSQL (via `AshPostgres`)
+1030 |- **ETS**: For in-memory storage (`Ash.DataLayer.Ets`)
+1031 |- **Mnesia**: For distributed storage (`Ash.DataLayer.Mnesia`)
+1032 |- **Embedded**: For resources embedded in other resources (`data_layer: :embedded`) (typically JSON under the hood)
+1033 |- **Ash.DataLayer.Simple**: For resources that aren't persisted at all. Leave off the data layer, as this is the default.
+1034 |
+1035 |Specify a data layer when defining a resource:
+1036 |
+1037 |```elixir
+1038 |defmodule MyApp.Post do
+1039 |  use Ash.Resource,
+1040 |    domain: MyApp.Blog,
+1041 |    data_layer: AshPostgres.DataLayer
+1042 |
+1043 |  postgres do
+1044 |    table "posts"
+1045 |    repo MyApp.Repo
+1046 |  end
+1047 |
+1048 |  # ... attributes, relationships, etc.
+1049 |end
+1050 |```
+1051 |
+1052 |For embedded resources:
+1053 |
+1054 |```elixir
+1055 |defmodule MyApp.Address do
+1056 |  use Ash.Resource,
+1057 |    data_layer: :embedded
+1058 |
+1059 |  attributes do
+1060 |    attribute :street, :string
+1061 |    attribute :city, :string
+1062 |    attribute :state, :string
+1063 |    attribute :zip, :string
+1064 |  end
+1065 |end
+1066 |```
+1067 |
+1068 |Each data layer has its own configuration options and capabilities. Refer to the rules & documentation of the specific data layer package for more details.
+1069 |
+1070 |## Migrations and Schema Changes
+1071 |
+1072 |After creating or modifying Ash code, run `mix ash.codegen <short_name_describing_changes>` to ensure any required additional changes are made (like migrations are generated). The name of the migration should be lower_snake_case. In a longer running dev session it's usually better to use `mix ash.codegen --dev` as you go and at the end run the final codegen with a sensible name describing all the changes made in the session.
+1073 |
+1074 |## Authorization
+1075 |
+1076 |- When performing administrative actions, you can bypass authorization with `authorize?: false`
+1077 |- To run actions as a particular user, look that user up and pass it as the `actor` option
+1078 |- Always set the actor on the query/changeset/input, not when calling the action
+1079 |- Use policies to define authorization rules
+1080 |
+1081 |```elixir
+1082 |# Good
+1083 |Post
+1084 ||> Ash.Query.for_read(:read, %{}, actor: current_user)
+1085 ||> Ash.read!()
+1086 |
+1087 |# BAD, DO NOT DO THIS
+1088 |Post
+1089 ||> Ash.Query.for_read(:read, %{})
+1090 ||> Ash.read!(actor: current_user)
+1091 |```
+1092 |
+1093 |### Policies
+1094 |
+1095 |To use policies, add the `Ash.Policy.Authorizer` to your resource:
+1096 |
+1097 |```elixir
+1098 |defmodule MyApp.Post do
+1099 |  use Ash.Resource,
+1100 |    domain: MyApp.Blog,
+1101 |    authorizers: [Ash.Policy.Authorizer]
+1102 |
+1103 |  # Rest of resource definition...
+1104 |end
+1105 |```
+1106 |
+1107 |### Policy Basics
+1108 |
+1109 |Policies determine what actions on a resource are permitted for a given actor. Define policies in the `policies` block:
+1110 |
+1111 |```elixir
+1112 |policies do
+1113 |  # A simple policy that applies to all read actions
+1114 |  policy action_type(:read) do
+1115 |    # Authorize if record is public
+1116 |    authorize_if expr(public == true)
+1117 |
+1118 |    # Authorize if actor is the owner
+1119 |    authorize_if relates_to_actor_via(:owner)
+1120 |  end
+1121 |
+1122 |  # A policy for create actions
+1123 |  policy action_type(:create) do
+1124 |    # Only allow active users to create records
+1125 |    forbid_unless actor_attribute_equals(:active, true)
+1126 |
+1127 |    # Ensure the record being created relates to the actor
+1128 |    authorize_if relating_to_actor(:owner)
+1129 |  end
+1130 |end
+1131 |```
+1132 |
+1133 |### Policy Evaluation Flow
+1134 |
+1135 |Policies evaluate from top to bottom with the following logic:
+1136 |
+1137 |1. All policies that apply to an action must pass for the action to be allowed
+1138 |2. Within each policy, checks evaluate from top to bottom
+1139 |3. The first check that produces a decision determines the policy result
+1140 |4. If no check produces a decision, the policy defaults to forbidden
+1141 |
+1142 |### IMPORTANT: Policy Check Logic
+1143 |
+1144 |**the first check that yields a result determines the policy outcome**
+1145 |
+1146 |```elixir
+1147 |# WRONG - This is OR logic, not AND logic!
+1148 |policy action_type(:update) do
+1149 |  authorize_if actor_attribute_equals(:admin?, true)    # If this passes, policy passes
+1150 |  authorize_if relates_to_actor_via(:owner)           # Only checked if first fails
+1151 |end
+1152 |```
+1153 |
+1154 |To require BOTH conditions in that exmaple, you would use `forbid_unless` for the first condition:
+1155 |
+1156 |```elixir
+1157 |# CORRECT - This requires BOTH conditions
+1158 |policy action_type(:update) do
+1159 |  forbid_unless actor_attribute_equals(:admin?, true)  # Must be admin
+1160 |  authorize_if relates_to_actor_via(:owner)           # AND must be owner
+1161 |end
+1162 |```
+1163 |
+1164 |Alternative patterns for AND logic:
+1165 |- Use multiple separate policies (each must pass independently)
+1166 |- Use a single complex expression with `expr(condition1 and condition2)`
+1167 |- Use `forbid_unless` for required conditions, then `authorize_if` for the final check
+1168 |
+1169 |### Bypass Policies
+1170 |
+1171 |Use bypass policies to allow certain actors to bypass other policy restrictions. This should be used almost exclusively for admin bypasses.
+1172 |
+1173 |```elixir
+1174 |policies do
+1175 |  # Bypass policy for admins - if this passes, other policies don't need to pass
+1176 |  bypass actor_attribute_equals(:admin, true) do
+1177 |    authorize_if always()
+1178 |  end
+1179 |
+1180 |  # Regular policies follow...
+1181 |  policy action_type(:read) do
+1182 |    # ...
+1183 |  end
+1184 |end
+1185 |```
+1186 |
+1187 |### Field Policies
+1188 |
+1189 |Field policies control access to specific fields (attributes, calculations, aggregates):
+1190 |
+1191 |```elixir
+1192 |field_policies do
+1193 |  # Only supervisors can see the salary field
+1194 |  field_policy :salary do
+1195 |    authorize_if actor_attribute_equals(:role, :supervisor)
+1196 |  end
+1197 |
+1198 |  # Allow access to all other fields
+1199 |  field_policy :* do
+1200 |    authorize_if always()
+1201 |  end
+1202 |end
+1203 |```
+1204 |
+1205 |### Policy Checks
+1206 |
+1207 |There are two main types of checks used in policies:
+1208 |
+1209 |1. **Simple checks** - Return true/false answers (e.g., "is the actor an admin?")
+1210 |2. **Filter checks** - Return filters to apply to data (e.g., "only show records owned by the actor")
+1211 |
+1212 |You can use built-in checks or create custom ones:
+1213 |
+1214 |```elixir
+1215 |# Built-in checks
+1216 |authorize_if actor_attribute_equals(:role, :admin)
+1217 |authorize_if relates_to_actor_via(:owner)
+1218 |authorize_if expr(public == true)
+1219 |
+1220 |# Custom check module
+1221 |authorize_if MyApp.Checks.ActorHasPermission
+1222 |```
+1223 |
+1224 |#### Custom Policy Checks
+1225 |
+1226 |Create custom checks by implementing `Ash.Policy.SimpleCheck` or `Ash.Policy.FilterCheck`:
+1227 |
+1228 |```elixir
+1229 |# Simple check - returns true/false
+1230 |defmodule MyApp.Checks.ActorHasRole do
+1231 |  use Ash.Policy.SimpleCheck
+1232 |
+1233 |  def match?(%{role: actor_role}, _context, opts) do
+1234 |    actor_role == (opts[:role] || :admin)
+1235 |  end
+1236 |  def match?(_, _, _), do: false
+1237 |end
+1238 |
+1239 |# Filter check - returns query filter
+1240 |defmodule MyApp.Checks.VisibleToUserLevel do
+1241 |  use Ash.Policy.FilterCheck
+1242 |
+1243 |  def filter(actor, _authorizer, _opts) do
+1244 |    expr(visibility_level <= ^actor.user_level)
+1245 |  end
+1246 |end
+1247 |
+1248 |# Usage
+1249 |policy action_type(:read) do
+1250 |  authorize_if {MyApp.Checks.ActorHasRole, role: :manager}
+1251 |  authorize_if MyApp.Checks.VisibleToUserLevel
+1252 |end
+1253 |```
+1254 |
+1255 |## Calculations
+1256 |
+1257 |Calculations allow you to define derived values based on a resource's attributes or related data. Define calculations in the `calculations` block of a resource:
+1258 |
+1259 |```elixir
+1260 |calculations do
+1261 |  # Simple expression calculation
+1262 |  calculate :full_name, :string, expr(first_name <> " " <> last_name)
+1263 |
+1264 |  # Expression with conditions
+1265 |  calculate :status_label, :string, expr(
+1266 |    cond do
+1267 |      status == :active -> "Active"
+1268 |      status == :pending -> "Pending Review"
+1269 |      true -> "Inactive"
+1270 |    end
+1271 |  )
+1272 |
+1273 |  # Using module calculations for more complex logic
+1274 |  calculate :risk_score, :integer, {MyApp.Calculations.RiskScore, min: 0, max: 100}
+1275 |end
+1276 |```
+1277 |
+1278 |### Expression Calculations
+1279 |
+1280 |Expression calculations use Ash expressions and can be pushed down to the data layer when possible:
+1281 |
+1282 |```elixir
+1283 |calculations do
+1284 |  # Simple string concatenation
+1285 |  calculate :full_name, :string, expr(first_name <> " " <> last_name)
+1286 |
+1287 |  # Math operations
+1288 |  calculate :total_with_tax, :decimal, expr(amount * (1 + tax_rate))
+1289 |
+1290 |  # Date manipulation
+1291 |  calculate :days_since_created, :integer, expr(
+1292 |    date_diff(^now(), inserted_at, :day)
+1293 |  )
+1294 |end
+1295 |```
+1296 |
+1297 |### Module Calculations
+1298 |
+1299 |For complex calculations, create a module that implements `Ash.Resource.Calculation`:
+1300 |
+1301 |```elixir
+1302 |defmodule MyApp.Calculations.FullName do
+1303 |  use Ash.Resource.Calculation
+1304 |
+1305 |  # Validate and transform options
+1306 |  @impl true
+1307 |  def init(opts) do
+1308 |    {:ok, Map.put_new(opts, :separator, " ")}
+1309 |  end
+1310 |
+1311 |  # Specify what data needs to be loaded
+1312 |  @impl true
+1313 |  def load(_query, _opts, _context) do
+1314 |    [:first_name, :last_name]
+1315 |  end
+1316 |
+1317 |  # Implement the calculation logic
+1318 |  @impl true
+1319 |  def calculate(records, opts, _context) do
+1320 |    Enum.map(records, fn record ->
+1321 |      [record.first_name, record.last_name]
+1322 |      |> Enum.reject(&is_nil/1)
+1323 |      |> Enum.join(opts.separator)
+1324 |    end)
+1325 |  end
+1326 |end
+1327 |
+1328 |# Usage in a resource
+1329 |calculations do
+1330 |  calculate :full_name, :string, {MyApp.Calculations.FullName, separator: ", "}
+1331 |end
+1332 |```
+1333 |
+1334 |### Calculations with Arguments
+1335 |
+1336 |You can define calculations that accept arguments:
+1337 |
+1338 |```elixir
+1339 |calculations do
+1340 |  calculate :full_name, :string, expr(first_name <> ^arg(:separator) <> last_name) do
+1341 |    argument :separator, :string do
+1342 |      allow_nil? false
+1343 |      default " "
+1344 |      constraints [allow_empty?: true, trim?: false]
+1345 |    end
+1346 |  end
+1347 |end
+1348 |```
+1349 |
+1350 |### Using Calculations
+1351 |
+1352 |```elixir
+1353 |# Using code interface options (preferred)
+1354 |users = MyDomain.list_users!(load: [full_name: [separator: ", "]])
+1355 |
+1356 |# Filtering and sorting
+1357 |users = MyDomain.list_users!(
+1358 |  query: [
+1359 |    filter: [full_name: [separator: " ", value: "John Doe"]],
+1360 |    sort: [full_name: {[separator: " "], :asc}]
+1361 |  ]
+1362 |)
+1363 |
+1364 |# Manual query building (for complex cases)
+1365 |User |> Ash.Query.load(full_name: [separator: ", "]) |> Ash.read!()
+1366 |
+1367 |# Loading on existing records
+1368 |Ash.load!(users, :full_name)
+1369 |```
+1370 |
+1371 |### Code Interface for Calculations
+1372 |
+1373 |Define calculation functions on your domain for standalone use:
+1374 |
+1375 |```elixir
+1376 |# In your domain
+1377 |resource User do
+1378 |  define_calculation :full_name, args: [:first_name, :last_name, {:optional, :separator}]
+1379 |end
+1380 |
+1381 |# Then call it directly
+1382 |MyDomain.full_name("John", "Doe", ", ")  # Returns "John, Doe"
+1383 |```
+1384 |
+1385 |## Aggregates
+1386 |
+1387 |Aggregates allow you to retrieve summary information over groups of related data, like counts, sums, or averages. Define aggregates in the `aggregates` block of a resource:
+1388 |
+1389 |```elixir
+1390 |aggregates do
+1391 |  # Count the number of published posts for a user
+1392 |  count :published_post_count, :posts do
+1393 |    filter expr(published == true)
+1394 |  end
+1395 |
+1396 |  # Sum the total amount of all orders
+1397 |  sum :total_sales, :orders, :amount
+1398 |
+1399 |  # Check if a user has any admin roles
+1400 |  exists :is_admin, :roles do
+1401 |    filter expr(name == "admin")
+1402 |  end
+1403 |end
+1404 |```
+1405 |
+1406 |### Aggregate Types
+1407 |
+1408 |- **count**: Counts related items meeting criteria
+1409 |- **sum**: Sums a field across related items
+1410 |- **exists**: Returns boolean indicating if matching related items exist
+1411 |- **first**: Gets the first related value matching criteria
+1412 |- **list**: Lists the related values for a specific field
+1413 |- **max**: Gets the maximum value of a field
+1414 |- **min**: Gets the minimum value of a field
+1415 |- **avg**: Gets the average value of a field
+1416 |
+1417 |### Using Aggregates
+1418 |
+1419 |```elixir
+1420 |# Using code interface options (preferred)
+1421 |users = MyDomain.list_users!(
+1422 |  load: [:published_post_count, :total_sales],
+1423 |  query: [
+1424 |    filter: [published_post_count: [greater_than: 5]],
+1425 |    sort: [published_post_count: :desc]
+1426 |  ]
+1427 |)
+1428 |
+1429 |# Manual query building (for complex cases)
+1430 |User |> Ash.Query.filter(published_post_count > 5) |> Ash.read!()
+1431 |
+1432 |# Loading on existing records
+1433 |Ash.load!(users, :published_post_count)
+1434 |```
+1435 |
+1436 |### Join Filters
+1437 |
+1438 |For complex aggregates involving multiple relationships, use join filters:
+1439 |
+1440 |```elixir
+1441 |aggregates do
+1442 |  sum :redeemed_deal_amount, [:redeems, :deal], :amount do
+1443 |    # Filter on the aggregate as a whole
+1444 |    filter expr(redeems.redeemed == true)
+1445 |
+1446 |    # Apply filters to specific relationship steps
+1447 |    join_filter :redeems, expr(redeemed == true)
+1448 |    join_filter [:redeems, :deal], expr(active == parent(require_active))
+1449 |  end
+1450 |end
+1451 |```
+1452 |
+1453 |### Inline Aggregates
+1454 |
+1455 |Use aggregates inline within expressions:
+1456 |
+1457 |```elixir
+1458 |calculate :grade_percentage, :decimal, expr(
+1459 |  count(answers, query: [filter: expr(correct == true)]) * 100 /
+1460 |  count(answers)
+1461 |)
+1462 |```
+1463 |
+1464 |## Testing
+1465 |
+1466 |When testing resources:
+1467 |- Test your domain actions through the code interface
+1468 |- Use test utilities in `Ash.Test`
+1469 |- Test authorization policies work as expected using `Ash.can?`
+1470 |- Use `authorize?: false` in tests where authorization is not the focus
+1471 |- Write generators using `Ash.Generator`
+1472 |- Prefer to use raising versions of functions whenever possible, as opposed to pattern matching
+1473 |
+1474 |<-- ash-end -->
+1475 |<-- ash_phoenix-start -->
+1476 |## ash_phoenix usage
+1477 |# Rules for working with AshPhoenix
+1478 |
+1479 |## Understanding AshPhoenix
+1480 |
+1481 |AshPhoenix is a package for integrating Ash Framework with Phoenix Framework. It provides tools for integrating with Phoenix forms (`AshPhoenix.Form`), Phoenix LiveViews (`AshPhoenix.LiveView`), and more. AshPhoenix makes it seamless to use Phoenix's powerful UI capabilities with Ash's data management features.
+1482 |
+1483 |## Form Integration
+1484 |
+1485 |AshPhoenix provides `AshPhoenix.Form`, a powerful module for creating and handling forms backed by Ash resources.
+1486 |
+1487 |### Creating Forms
+1488 |
+1489 |```elixir
+1490 |# For creating a new resource
+1491 |form = AshPhoenix.Form.for_create(MyApp.Blog.Post, :create)
+1492 |
+1493 |# For updating an existing resource
+1494 |post = MyApp.Blog.get_post!(post_id)
+1495 |form = AshPhoenix.Form.for_update(post, :update)
+1496 |
+1497 |# Form with initial value
+1498 |form = AshPhoenix.Form.for_create(MyApp.Blog.Post, :create,
+1499 |  params: %{title: "Draft Title"}
+1500 |)
+1501 |```
+1502 |
+1503 |### Code Interfaces
+1504 |
+1505 |Using the `AshPhoenix` extension in domains gets you special functions in a resource's
+1506 |code interface called `form_to_*`. Use this whenever possible.
+1507 |
+1508 |First, add the `AshPhoenix` extension to our domains and resources, like so:
+1509 |
+1510 |```elixir
+1511 |use Ash.Domain,
+1512 |  extensions: [AshPhoenix]
+1513 |```
+1514 |
+1515 |which will cause another function to be generated for each definition, beginning with `form_to_`.
+1516 |
+1517 |For example, if you had the following,
+1518 |```elixir
+1519 |# in MyApp.Accounts
+1520 |resources do
+1521 |  resource MyApp.Accounts.User do
+1522 |    define :register_with_password, args: [:email, :password]
+1523 |  end
+1524 |end
+1525 |```
+1526 |
+1527 |you could then make a form with:
+1528 |
+1529 |```elixir
+1530 |MyApp.Accounts.register_with_password(...opts)
+1531 |```
+1532 |
+1533 |By default, the `args` option in `define` is ignored when building forms. If you want to have positional arguments, configure that in the `forms` section which is added by the `AshPhoenix` section. For example:
+1534 |
+1535 |```elixir
+1536 |forms do
+1537 |  form :register_with_password, args: [:email]
+1538 |end
+1539 |```
+1540 |
+1541 |Which could then be used as:
+1542 |
+1543 |```elixir
+1544 |MyApp.Accounts.register_with_password(email, ...)
+1545 |```
+1546 |
+1547 |These positional arguments are *very important* for certain cases, because there may be values you do not want the form to be able to set. For example, when updating a user's settings, maybe the action takes a `user_id`, but the form is on a page for a specific user's id and so this should therefore not be editable in the form. Use positional arguments for this.
+1548 |
+1549 |### Handling Form Submission
+1550 |
+1551 |In your LiveView:
+1552 |
+1553 |```elixir
+1554 |def handle_event("validate", %{"form" => params}, socket) do
+1555 |  form = AshPhoenix.Form.validate(socket.assigns.form, params)
+1556 |  {:noreply, assign(socket, :form, form)}
+1557 |end
+1558 |
+1559 |def handle_event("submit", %{"form" => params}, socket) do
+1560 |  case AshPhoenix.Form.submit(socket.assigns.form, params: params) do
+1561 |    {:ok, post} ->
+1562 |      socket =
+1563 |        socket
+1564 |        |> put_flash(:info, "Post created successfully")
+1565 |        |> push_navigate(to: ~p"/posts/#{post.id}")
+1566 |      {:noreply, socket}
+1567 |
+1568 |    {:error, form} ->
+1569 |      {:noreply, assign(socket, :form, form)}
+1570 |  end
+1571 |end
+1572 |```
+1573 |
+1574 |## Nested Forms
+1575 |
+1576 |AshPhoenix supports forms with nested relationships, such as creating or updating related resources in a single form.
+1577 |
+1578 |### Automatically Inferred Nested Forms
+1579 |
+1580 |If your action has `manage_relationship`, AshPhoenix automatically infers nested forms:
+1581 |
+1582 |```elixir
+1583 |# In your resource:
+1584 |create :create do
+1585 |  accept [:name]
+1586 |  argument :locations, {:array, :map}
+1587 |  change manage_relationship(:locations, type: :create)
+1588 |end
+1589 |
+1590 |# In your template:
+1591 |<.simple_form for={@form} phx-change="validate" phx-submit="submit">
+1592 |  <.input field={@form[:name]} />
+1593 |
+1594 |  <.inputs_for :let={location} field={@form[:locations]}>
+1595 |    <.input field={location[:name]} />
+1596 |  </.inputs_for>
+1597 |</.simple_form>
+1598 |```
+1599 |
+1600 |### Adding and Removing Nested Forms
+1601 |
+1602 |To add a nested form with a button:
+1603 |
+1604 |```heex
+1605 |<.button type="button" phx-click="add-form" phx-value-path={@form.name <> "[locations]"}>
+1606 |  <.icon name="hero-plus" />
+1607 |</.button>
+1608 |```
+1609 |
+1610 |In your LiveView:
+1611 |
+1612 |```elixir
+1613 |def handle_event("add-form", %{"path" => path}, socket) do
+1614 |  form = AshPhoenix.Form.add_form(socket.assigns.form, path)
+1615 |  {:noreply, assign(socket, :form, form)}
+1616 |end
+1617 |```
+1618 |
+1619 |To remove a nested form:
+1620 |
+1621 |```heex
+1622 |<.button type="button" phx-click="remove-form" phx-value-path={location.name}>
+1623 |  <.icon name="hero-x-mark" />
+1624 |</.button>
+1625 |```
+1626 |
+1627 |```elixir
+1628 |def handle_event("remove-form", %{"path" => path}, socket) do
+1629 |  form = AshPhoenix.Form.remove_form(socket.assigns.form, path)
+1630 |  {:noreply, assign(socket, :form, form)}
+1631 |end
+1632 |```
+1633 |
+1634 |## Union Forms
+1635 |
+1636 |AshPhoenix supports forms for union types, allowing different inputs based on the selected type.
+1637 |
+1638 |```heex
+1639 |<.inputs_for :let={fc} field={@form[:content]}>
+1640 |  <.input
+1641 |    field={fc[:_union_type]}
+1642 |    phx-change="type-changed"
+1643 |    type="select"
+1644 |    options={[Normal: "normal", Special: "special"]}
+1645 |  />
+1646 |
+1647 |  <%= case fc.params["_union_type"] do %>
+1648 |    <% "normal" -> %>
+1649 |      <.input type="text" field={fc[:body]} />
+1650 |    <% "special" -> %>
+1651 |      <.input type="text" field={fc[:text]} />
+1652 |  <% end %>
+1653 |</.inputs_for>
+1654 |```
+1655 |
+1656 |In your LiveView:
+1657 |
+1658 |```elixir
+1659 |def handle_event("type-changed", %{"_target" => path} = params, socket) do
+1660 |  new_type = get_in(params, path)
+1661 |  path = :lists.droplast(path)
+1662 |
+1663 |  form =
+1664 |    socket.assigns.form
+1665 |    |> AshPhoenix.Form.remove_form(path)
+1666 |    |> AshPhoenix.Form.add_form(path, params: %{"_union_type" => new_type})
+1667 |
+1668 |  {:noreply, assign(socket, :form, form)}
+1669 |end
+1670 |```
+1671 |
+1672 |## Error Handling
+1673 |
+1674 |AshPhoenix provides helpful error handling mechanisms:
+1675 |
+1676 |```elixir
+1677 |# In your LiveView
+1678 |def handle_event("submit", %{"form" => params}, socket) do
+1679 |  case AshPhoenix.Form.submit(socket.assigns.form, params: params) do
+1680 |    {:ok, post} ->
+1681 |      # Success path
+1682 |      {:noreply, success_path(socket, post)}
+1683 |
+1684 |    {:error, form} ->
+1685 |      # Show validation errors
+1686 |      {:noreply, assign(socket, form: form)}
+1687 |  end
+1688 |end
+1689 |```
+1690 |
+1691 |## Best Practices
+1692 |
+1693 |1. **Let the Resource guide the UI**: Your Ash resource configuration determines a lot about how forms and inputs will work. Well-defined resources with appropriate validations and changes make AshPhoenix more effective.
+1694 |
+1695 |2. **Leverage code interfaces**: Define code interfaces on your domains for a clean and consistent API to call your resource actions.
+1696 |
+1697 |3. **Update resources before editing**: When building forms for updating resources, load the resource with all required relationships using `Ash.load!/2` before creating the form.
+1698 |
+1699 |<-- ash_phoenix-end -->
+1700 |<-- ash_authentication-start -->
+1701 |## ash_authentication usage
+1702 |# AshAuthentication Usage Rules
+1703 |
+1704 |## Core Concepts
+1705 |- **Strategies**: password, OAuth2, magic_link, api_key authentication methods
+1706 |- **Tokens**: JWT for stateless authentication
+1707 |- **UserIdentity**: links users to OAuth2 providers
+1708 |- **Add-ons**: confirmation, logout-everywhere functionality
+1709 |- **Actions**: auto-generated by strategies (register, sign_in, etc.), can be overridden on the resource
+1710 |
+1711 |## Key Principles
+1712 |- Always use secrets management - never hardcode credentials
+1713 |- Enable tokens for magic_link, confirmation, OAuth2
+1714 |- UserIdentity resource optional for OAuth2 (required for multiple providers per user)
+1715 |- API keys require strict policy controls and expiration management
+1716 |- Use prefixes for API keys to enable secret scanning compliance
+1717 |- Check existing strategies: `AshAuthentication.Info.strategies/1`
+1718 |
+1719 |## Strategy Selection
+1720 |
+1721 |**Password** - Email/password authentication
+1722 |- Requires: `:email`, `:hashed_password` attributes, unique identity
+1723 |
+1724 |**Magic Link** - Passwordless email authentication
+1725 |- Requires: `:email` attribute, sender implementation, tokens enabled
+1726 |
+1727 |**API Key** - Token-based authentication for APIs
+1728 |- Requires: API key resource, relationship to user, sign-in action
+1729 |
+1730 |**OAuth2** - Social/enterprise login (GitHub, Google, Auth0, Apple, OIDC, Slack)
+1731 |- Requires: custom actions, secrets
+1732 |- Optional: UserIdentity resource (for multiple providers per user)
+1733 |
+1734 |## Password Strategy
+1735 |
+1736 |```elixir
+1737 |authentication do
+1738 |  strategies do
+1739 |    password :password do
+1740 |      identity_field :email
+1741 |      hashed_password_field :hashed_password
+1742 |      resettable do
+1743 |        sender MyApp.PasswordResetSender
+1744 |      end
+1745 |    end
+1746 |  end
+1747 |end
+1748 |
+1749 |# Required attributes:
+1750 |attributes do
+1751 |  attribute :email, :ci_string, allow_nil?: false, public?: true
+1752 |  attribute :hashed_password, :string, allow_nil?: false, sensitive?: true
+1753 |end
+1754 |
+1755 |identities do
+1756 |  identity :unique_email, [:email]
+1757 |end
+1758 |```
+1759 |
+1760 |## Magic Link Strategy
+1761 |
+1762 |```elixir
+1763 |authentication do
+1764 |  strategies do
+1765 |    magic_link do
+1766 |      identity_field :email
+1767 |      sender MyApp.MagicLinkSender
+1768 |    end
+1769 |  end
+1770 |end
+1771 |
+1772 |# Sender implementation required:
+1773 |defmodule MyApp.MagicLinkSender do
+1774 |  use AshAuthentication.Sender
+1775 |
+1776 |  def send(user_or_email, token, _opts) do
+1777 |    MyApp.Emails.deliver_magic_link(user_or_email, token)
+1778 |  end
+1779 |end
+1780 |```
+1781 |
+1782 |## API Key Strategy
+1783 |
+1784 |```elixir
+1785 |# 1. Create API key resource
+1786 |defmodule MyApp.Accounts.ApiKey do
+1787 |  use Ash.Resource,
+1788 |    data_layer: AshPostgres.DataLayer,
+1789 |    authorizers: [Ash.Policy.Authorizer]
+1790 |
+1791 |  actions do
+1792 |    defaults [:read, :destroy]
+1793 |
+1794 |    create :create do
+1795 |      primary? true
+1796 |      accept [:user_id, :expires_at]
+1797 |      change {AshAuthentication.Strategy.ApiKey.GenerateApiKey, prefix: :myapp, hash: :api_key_hash}
+1798 |    end
+1799 |  end
+1800 |
+1801 |  attributes do
+1802 |    uuid_primary_key :id
+1803 |    attribute :api_key_hash, :binary, allow_nil?: false, sensitive?: true
+1804 |    attribute :expires_at, :utc_datetime_usec, allow_nil?: false
+1805 |  end
+1806 |
+1807 |  relationships do
+1808 |    belongs_to :user, MyApp.Accounts.User, allow_nil?: false
+1809 |  end
+1810 |
+1811 |  calculations do
+1812 |    calculate :valid, :boolean, expr(expires_at > now())
+1813 |  end
+1814 |
+1815 |  identities do
+1816 |    identity :unique_api_key, [:api_key_hash]
+1817 |  end
+1818 |
+1819 |  policies do
+1820 |    bypass AshAuthentication.Checks.AshAuthenticationInteraction do
+1821 |      authorize_if always()
+1822 |    end
+1823 |  end
+1824 |end
+1825 |
+1826 |# 2. Add strategy to user resource
+1827 |authentication do
+1828 |  strategies do
+1829 |    api_key do
+1830 |      api_key_relationship :valid_api_keys
+1831 |      api_key_hash_attribute :api_key_hash
+1832 |    end
+1833 |  end
+1834 |end
+1835 |
+1836 |# 3. Add relationship to user
+1837 |relationships do
+1838 |  has_many :valid_api_keys, MyApp.Accounts.ApiKey do
+1839 |    filter expr(valid)
+1840 |  end
+1841 |end
+1842 |
+1843 |# 4. Add sign-in action to user
+1844 |actions do
+1845 |  read :sign_in_with_api_key do
+1846 |    argument :api_key, :string, allow_nil?: false
+1847 |    prepare AshAuthentication.Strategy.ApiKey.SignInPreparation
+1848 |  end
+1849 |end
+1850 |```
+1851 |
+1852 |**Security considerations:**
+1853 |- API keys are hashed for storage security
+1854 |- Use policies to restrict API key access to specific actions
+1855 |- Check `user.__metadata__[:using_api_key?]` to detect API key authentication
+1856 |- Access the API key via `user.__metadata__[:api_key]` for permission checks
+1857 |
+1858 |## OAuth2 Strategies
+1859 |
+1860 |**Supported providers:** github, google, auth0, apple, oidc, slack
+1861 |
+1862 |**Required for all OAuth2:**
+1863 |- Custom `register_with_[provider]` action
+1864 |- Secrets management
+1865 |- Tokens enabled
+1866 |
+1867 |**Optional for all OAuth2:**
+1868 |- UserIdentity resource (for multiple providers per user)
+1869 |
+1870 |### OAuth2 Configuration Pattern
+1871 |```elixir
+1872 |# Strategy configuration
+1873 |authentication do
+1874 |  strategies do
+1875 |    github do  # or google, auth0, apple, oidc, slack
+1876 |      client_id MyApp.Secrets
+1877 |      client_secret MyApp.Secrets
+1878 |      redirect_uri MyApp.Secrets
+1879 |      # auth0 also needs: base_url
+1880 |      # apple also needs: team_id, private_key_id, private_key_path
+1881 |      # oidc also needs: openid_configuration_uri
+1882 |      identity_resource MyApp.Accounts.UserIdentity
+1883 |    end
+1884 |  end
+1885 |end
+1886 |
+1887 |# Required action (replace 'github' with provider name)
+1888 |actions do
+1889 |  create :register_with_github do
+1890 |    argument :user_info, :map, allow_nil?: false
+1891 |    argument :oauth_tokens, :map, allow_nil?: false
+1892 |    upsert? true
+1893 |    upsert_identity :unique_email
+1894 |
+1895 |    change AshAuthentication.GenerateTokenChange
+1896 |    
+1897 |    # If UserIdentity resource is being used
+1898 |    change AshAuthentication.Strategy.OAuth2.IdentityChange
+1899 |
+1900 |    change fn changeset, _ctx ->
+1901 |      user_info = Ash.Changeset.get_argument(changeset, :user_info)
+1902 |      Ash.Changeset.change_attributes(changeset, Map.take(user_info, ["email"]))
+1903 |    end
+1904 |  end
+1905 |end
+1906 |```
+1907 |
+1908 |## Add-ons
+1909 |
+1910 |### Confirmation
+1911 |```elixir
+1912 |authentication do
+1913 |  tokens do
+1914 |    enabled? true
+1915 |    token_resource MyApp.Accounts.Token
+1916 |  end
+1917 |
+1918 |  add_ons do
+1919 |    confirmation :confirm do
+1920 |      monitor_fields [:email]
+1921 |      sender MyApp.ConfirmationSender
+1922 |    end
+1923 |  end
+1924 |end
+1925 |```
+1926 |
+1927 |### Log Out Everywhere
+1928 |```elixir
+1929 |authentication do
+1930 |  tokens do
+1931 |    store_all_tokens? true
+1932 |  end
+1933 |
+1934 |  add_ons do
+1935 |    log_out_everywhere do
+1936 |      apply_on_password_change? true
+1937 |    end
+1938 |  end
+1939 |end
+1940 |```
+1941 |
+1942 |## Working with Authentication
+1943 |
+1944 |### Strategy Protocol
+1945 |```elixir
+1946 |# Get and use strategies
+1947 |strategy = AshAuthentication.Info.strategy!(MyApp.User, :password)
+1948 |{:ok, user} = AshAuthentication.Strategy.action(strategy, :sign_in, params)
+1949 |
+1950 |# List strategies
+1951 |strategies = AshAuthentication.Info.strategies(MyApp.User)
+1952 |```
+1953 |
+1954 |### Token Operations
+1955 |```elixir
+1956 |# User/subject conversion
+1957 |subject = AshAuthentication.user_to_subject(user)
+1958 |{:ok, user} = AshAuthentication.subject_to_user(subject, MyApp.User)
+1959 |
+1960 |# Token management
+1961 |AshAuthentication.TokenResource.revoke(MyApp.Token, token)
+1962 |```
+1963 |
+1964 |### Policies
+1965 |```elixir
+1966 |policies do
+1967 |  bypass AshAuthentication.Checks.AshAuthenticationInteraction do
+1968 |    authorize_if always()
+1969 |  end
+1970 |end
+1971 |```
+1972 |
+1973 |## Common Implementation Patterns
+1974 |
+1975 |### Pattern: Multiple Authentication Methods
+1976 |When users need multiple ways to authenticate:
+1977 |
+1978 |```elixir
+1979 |authentication do
+1980 |  tokens do
+1981 |    enabled? true
+1982 |    token_resource MyApp.Accounts.Token
+1983 |  end
+1984 |
+1985 |  strategies do
+1986 |    password :password do
+1987 |      identity_field :email
+1988 |      hashed_password_field :hashed_password
+1989 |    end
+1990 |
+1991 |    github do
+1992 |      client_id MyApp.Secrets
+1993 |      client_secret MyApp.Secrets
+1994 |      redirect_uri MyApp.Secrets
+1995 |      identity_resource MyApp.Accounts.UserIdentity
+1996 |    end
+1997 |
+1998 |    magic_link do
+1999 |      identity_field :email
+2000 |      sender MyApp.MagicLinkSender
+2001 |    end
+2002 |  end
+2003 |end
+2004 |```
+2005 |
+2006 |### Pattern: OAuth2 with User Registration
+2007 |When new users can register via OAuth2:
+2008 |
+2009 |```elixir
+2010 |actions do
+2011 |  create :register_with_github do
+2012 |    argument :user_info, :map, allow_nil?: false
+2013 |    argument :oauth_tokens, :map, allow_nil?: false
+2014 |    upsert? true
+2015 |    upsert_identity :email
+2016 |
+2017 |    change AshAuthentication.GenerateTokenChange
+2018 |    change fn changeset, _ctx ->
+2019 |      user_info = Ash.Changeset.get_argument(changeset, :user_info)
+2020 |
+2021 |      changeset
+2022 |      |> Ash.Changeset.change_attribute(:email, user_info["email"])
+2023 |      |> Ash.Changeset.change_attribute(:name, user_info["name"])
+2024 |    end
+2025 |  end
+2026 |end
+2027 |```
+2028 |
+2029 |### Pattern: Custom Token Configuration
+2030 |When you need specific token behavior:
+2031 |
+2032 |```elixir
+2033 |authentication do
+2034 |  tokens do
+2035 |    enabled? true
+2036 |    token_resource MyApp.Accounts.Token
+2037 |    signing_secret MyApp.Secrets
+2038 |    token_lifetime {24, :hours}
+2039 |    store_all_tokens? true  # For logout-everywhere functionality
+2040 |    require_token_presence_for_authentication? false
+2041 |  end
+2042 |end
+2043 |```
+2044 |
+2045 |## Customizing Authentication Actions
+2046 |
+2047 |When customizing generated authentication actions (register, sign_in, etc.):
+2048 |
+2049 |**Key Security Rules:**
+2050 |- Always mark credentials with `sensitive?: true` (passwords, API keys, tokens)
+2051 |- Use `public?: false` for internal fields and highly sensitive PII
+2052 |- Use `public?: true` for identity fields and UI display data
+2053 |- Include required authentication changes (`GenerateTokenChange`, `HashPasswordChange`, etc.)
+2054 |
+2055 |**Argument Handling:**
+2056 |- All arguments must be used in `accept` or `change set_attribute()`
+2057 |- Use `allow_nil?: false` for required arguments
+2058 |- OAuth2 data must be extracted in changes, not accepted directly
+2059 |
+2060 |**Example Custom Registration:**
+2061 |```elixir
+2062 |create :register_with_password do
+2063 |  argument :password, :string, allow_nil?: false, sensitive?: true
+2064 |  argument :first_name, :string, allow_nil?: false
+2065 |  
+2066 |  accept [:email, :first_name]
+2067 |  
+2068 |  change AshAuthentication.GenerateTokenChange
+2069 |  change AshAuthentication.Strategy.Password.HashPasswordChange
+2070 |end
+2071 |```
+2072 |
+2073 |For more guidance, see the "Customizing Authentication Actions" section in the getting started guide.
+2074 |<-- ash_authentication-end -->
+2075 |<-- ash_postgres-start -->
+2076 |## ash_postgres usage
+2077 |# Rules for working with AshPostgres
+2078 |
+2079 |## Understanding AshPostgres
+2080 |
+2081 |AshPostgres is the PostgreSQL data layer for Ash Framework. It's the most fully-featured Ash data layer and should be your default choice unless you have specific requirements for another data layer. Any PostgreSQL version higher than 13 is fully supported.
+2082 |
+2083 |## Basic Configuration
+2084 |
+2085 |To use AshPostgres, add the data layer to your resource:
+2086 |
+2087 |```elixir
+2088 |defmodule MyApp.Tweet do
+2089 |  use Ash.Resource,
+2090 |    data_layer: AshPostgres.DataLayer
+2091 |
+2092 |  attributes do
+2093 |    integer_primary_key :id
+2094 |    attribute :text, :string
+2095 |  end
+2096 |
+2097 |  relationships do
+2098 |    belongs_to :author, MyApp.User
+2099 |  end
+2100 |
+2101 |  postgres do
+2102 |    table "tweets"
+2103 |    repo MyApp.Repo
+2104 |  end
+2105 |end
+2106 |```
+2107 |
+2108 |## PostgreSQL Configuration
+2109 |
+2110 |### Table & Schema Configuration
+2111 |
+2112 |```elixir
+2113 |postgres do
+2114 |  # Required: Define the table name for this resource
+2115 |  table "users"
+2116 |
+2117 |  # Optional: Define the PostgreSQL schema
+2118 |  schema "public"
+2119 |
+2120 |  # Required: Define the Ecto repo to use
+2121 |  repo MyApp.Repo
+2122 |
+2123 |  # Optional: Control whether migrations are generated for this resource
+2124 |  migrate? true
+2125 |end
+2126 |```
+2127 |
+2128 |## Foreign Key References
+2129 |
+2130 |Use the `references` section to configure foreign key behavior:
+2131 |
+2132 |```elixir
+2133 |postgres do
+2134 |  table "comments"
+2135 |  repo MyApp.Repo
+2136 |
+2137 |  references do
+2138 |    # Simple reference with defaults
+2139 |    reference :post
+2140 |
+2141 |    # Fully configured reference
+2142 |    reference :user,
+2143 |      on_delete: :delete,      # What happens when referenced row is deleted
+2144 |      on_update: :update,      # What happens when referenced row is updated
+2145 |      name: "comments_to_users_fkey", # Custom constraint name
+2146 |      deferrable: true,        # Make constraint deferrable
+2147 |      initially_deferred: false # Defer constraint check to end of transaction
+2148 |  end
+2149 |end
+2150 |```
+2151 |
+2152 |### Foreign Key Actions
+2153 |
+2154 |For `on_delete` and `on_update` options:
+2155 |
+2156 |- `:nothing` or `:restrict` - Prevent the change to the referenced row
+2157 |- `:delete` - Delete the row when the referenced row is deleted (for `on_delete` only)
+2158 |- `:update` - Update the row according to changes in the referenced row (for `on_update` only)
+2159 |- `:nilify` - Set all foreign key columns to NULL
+2160 |- `{:nilify, columns}` - Set specific columns to NULL (Postgres 15.0+ only)
+2161 |
+2162 |> **Warning**: These operations happen directly at the database level. No resource logic, authorization rules, validations, or notifications are triggered.
+2163 |
+2164 |## Check Constraints
+2165 |
+2166 |Define database check constraints:
+2167 |
+2168 |```elixir
+2169 |postgres do
+2170 |  check_constraints do
+2171 |    check_constraint :positive_amount,
+2172 |      check: "amount > 0",
+2173 |      name: "positive_amount_check",
+2174 |      message: "Amount must be positive"
+2175 |
+2176 |    check_constraint :status_valid,
+2177 |      check: "status IN ('pending', 'active', 'completed')"
+2178 |  end
+2179 |end
+2180 |```
+2181 |
+2182 |## Custom Indexes
+2183 |
+2184 |Define custom indexes beyond those automatically created for identities and relationships:
+2185 |
+2186 |```elixir
+2187 |postgres do
+2188 |  custom_indexes do
+2189 |    index [:first_name, :last_name]
+2190 |
+2191 |    index :email,
+2192 |      unique: true,
+2193 |      name: "users_email_index",
+2194 |      where: "email IS NOT NULL",
+2195 |      using: :gin
+2196 |
+2197 |    index [:status, :created_at],
+2198 |      concurrently: true,
+2199 |      include: [:user_id]
+2200 |  end
+2201 |end
+2202 |```
+2203 |
+2204 |## Custom SQL Statements
+2205 |
+2206 |Include custom SQL in migrations:
+2207 |
+2208 |```elixir
+2209 |postgres do
+2210 |  custom_statements do
+2211 |    statement "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\""
+2212 |
+2213 |    statement """
+2214 |    CREATE TRIGGER update_updated_at
+2215 |    BEFORE UPDATE ON posts
+2216 |    FOR EACH ROW
+2217 |    EXECUTE FUNCTION trigger_set_timestamp();
+2218 |    """
+2219 |
+2220 |    statement "DROP INDEX IF EXISTS posts_title_index",
+2221 |      on_destroy: true # Only run when resource is destroyed/dropped
+2222 |  end
+2223 |end
+2224 |```
+2225 |
+2226 |## Migrations and Codegen
+2227 |
+2228 |### Development Migration Workflow (Recommended)
+2229 |
+2230 |For development iterations, use the dev workflow to avoid naming migrations prematurely:
+2231 |
+2232 |1. Make resource changes
+2233 |2. Run `mix ash.codegen --dev` to generate and run dev migrations
+2234 |3. Review the migrations and run `mix ash.migrate` to run them
+2235 |4. Continue making changes and running `mix ash.codegen --dev` as needed
+2236 |5. When your feature is complete, run `mix ash.codegen add_feature_name` to generate final named migrations (this will rollback dev migrations and squash them)
+2237 |3. Review the migrations and run `mix ash.migrate` to run them
+2238 |
+2239 |### Traditional Migration Generation
+2240 |
+2241 |For single-step changes or when you know the final feature name:
+2242 |
+2243 |1. Run `mix ash.codegen add_feature_name` to generate migrations
+2244 |2. Review the generated migrations in `priv/repo/migrations`
+2245 |3. Run `mix ash.migrate` to apply the migrations
+2246 |
+2247 |> **Tip**: The dev workflow (`--dev` flag) is preferred during development as it allows you to iterate without thinking of migration names and provides better development ergonomics.
+2248 |
+2249 |> **Warning**: Always review migrations before applying them to ensure they are correct and safe.
+2250 |
+2251 |## Multitenancy
+2252 |
+2253 |AshPostgres supports schema-based multitenancy:
+2254 |
+2255 |```elixir
+2256 |defmodule MyApp.Tenant do
+2257 |  use Ash.Resource,
+2258 |    data_layer: AshPostgres.DataLayer
+2259 |
+2260 |  # Resource definition...
+2261 |
+2262 |  postgres do
+2263 |    table "tenants"
+2264 |    repo MyApp.Repo
+2265 |
+2266 |    # Automatically create/manage tenant schemas
+2267 |    manage_tenant do
+2268 |      template ["tenant_", :id]
+2269 |    end
+2270 |  end
+2271 |end
+2272 |```
+2273 |
+2274 |### Setting Up Multitenancy
+2275 |
+2276 |1. Configure your repo to support multitenancy:
+2277 |
+2278 |```elixir
+2279 |defmodule MyApp.Repo do
+2280 |  use AshPostgres.Repo, otp_app: :my_app
+2281 |
+2282 |  # Return all tenant schemas for migrations
+2283 |  def all_tenants do
+2284 |    import Ecto.Query, only: [from: 2]
+2285 |    all(from(t in "tenants", select: fragment("? || ?", "tenant_", t.id)))
+2286 |  end
+2287 |end
+2288 |```
+2289 |
+2290 |2. Mark resources that should be multi-tenant:
+2291 |
+2292 |```elixir
+2293 |defmodule MyApp.Post do
+2294 |  use Ash.Resource,
+2295 |    data_layer: AshPostgres.DataLayer
+2296 |
+2297 |  multitenancy do
+2298 |    strategy :context
+2299 |    attribute :tenant
+2300 |  end
+2301 |
+2302 |  # Resource definition...
+2303 |end
+2304 |```
+2305 |
+2306 |3. When tenant migrations are generated, they'll be in `priv/repo/tenant_migrations`
+2307 |
+2308 |4. Run tenant migrations in addition to regular migrations:
+2309 |
+2310 |```bash
+2311 |# Run regular migrations
+2312 |mix ash.migrate
+2313 |
+2314 |# Run tenant migrations
+2315 |mix ash_postgres.migrate --tenants
+2316 |```
+2317 |
+2318 |## Advanced Features
+2319 |
+2320 |### Manual Relationships
+2321 |
+2322 |For complex relationships that can't be expressed with standard relationship types:
+2323 |
+2324 |```elixir
+2325 |defmodule MyApp.Post.Relationships.HighlyRatedComments do
+2326 |  use Ash.Resource.ManualRelationship
+2327 |  use AshPostgres.ManualRelationship
+2328 |
+2329 |  def load(posts, _opts, context) do
+2330 |    post_ids = Enum.map(posts, & &1.id)
+2331 |
+2332 |    {:ok,
+2333 |     MyApp.Comment
+2334 |     |> Ash.Query.filter(post_id in ^post_ids)
+2335 |     |> Ash.Query.filter(rating > 4)
+2336 |     |> MyApp.read!()
+2337 |     |> Enum.group_by(& &1.post_id)}
+2338 |  end
+2339 |
+2340 |  def ash_postgres_join(query, _opts, current_binding, as_binding, :inner, destination_query) do
+2341 |    {:ok,
+2342 |     Ecto.Query.from(_ in query,
+2343 |       join: dest in ^destination_query,
+2344 |       as: ^as_binding,
+2345 |       on: dest.post_id == as(^current_binding).id,
+2346 |       on: dest.rating > 4
+2347 |     )}
+2348 |  end
+2349 |
+2350 |  # Other required callbacks...
+2351 |end
+2352 |
+2353 |# In your resource:
+2354 |relationships do
+2355 |  has_many :highly_rated_comments, MyApp.Comment do
+2356 |    manual MyApp.Post.Relationships.HighlyRatedComments
+2357 |  end
+2358 |end
+2359 |```
+2360 |
+2361 |### Using Multiple Repos (Read Replicas)
+2362 |
+2363 |Configure different repos for reads vs mutations:
+2364 |
+2365 |```elixir
+2366 |postgres do
+2367 |  repo fn resource, type ->
+2368 |    case type do
+2369 |      :read -> MyApp.ReadReplicaRepo
+2370 |      :mutate -> MyApp.WriteRepo
+2371 |    end
+2372 |  end
+2373 |end
+2374 |```
+2375 |
+2376 |## Best Practices
+2377 |
+2378 |1. **Organize migrations**: Run `mix ash.codegen` after each meaningful set of resource changes with a descriptive name:
+2379 |   ```bash
+2380 |   mix ash.codegen --name add_user_roles
+2381 |   mix ash.codegen --name implement_post_tagging
+2382 |   ```
+2383 |
+2384 |2. **Use check constraints for domain invariants**: Enforce data integrity at the database level:
+2385 |   ```elixir
+2386 |   check_constraints do
+2387 |     check_constraint :valid_status, check: "status IN ('pending', 'active', 'completed')"
+2388 |     check_constraint :positive_balance, check: "balance >= 0"
+2389 |   end
+2390 |   ```
+2391 |
+2392 |3. **Use custom statements for schema-only changes**: If you need to add database objects not directly tied to resources:
+2393 |   ```elixir
+2394 |   custom_statements do
+2395 |     statement "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\""
+2396 |     statement "CREATE INDEX users_search_idx ON users USING gin(search_vector)"
+2397 |   end
+2398 |   ```
+2399 |
+2400 |Remember that using AshPostgres provides a full-featured PostgreSQL data layer for your Ash application, giving you both the structure and declarative approach of Ash along with the power and flexibility of PostgreSQL.
+2401 |
+2402 |<-- ash_postgres-end -->
+2403 |<-- igniter-start -->
+2404 |## igniter usage
+2405 |# Rules for working with Igniter
+2406 |
+2407 |## Understanding Igniter
+2408 |
+2409 |Igniter is a code generation and project patching framework that enables semantic manipulation of Elixir codebases. It provides tools for creating intelligent generators that can both create new files and modify existing ones safely. Igniter works with AST (Abstract Syntax Trees) through Sourceror.Zipper to make precise, context-aware changes to your code.
+2410 |
+2411 |## Available Modules
+2412 |
+2413 |### Project-Level Modules (`Igniter.Project.*`)
+2414 |
+2415 |- **`Igniter.Project.Application`** - Working with Application modules and application configuration
+2416 |- **`Igniter.Project.Config`** - Modifying Elixir config files (config.exs, runtime.exs, etc.)
+2417 |- **`Igniter.Project.Deps`** - Managing dependencies declared in mix.exs
+2418 |- **`Igniter.Project.Formatter`** - Interacting with .formatter.exs files
+2419 |- **`Igniter.Project.IgniterConfig`** - Managing .igniter.exs configuration files
+2420 |- **`Igniter.Project.MixProject`** - Updating project configuration in mix.exs
+2421 |- **`Igniter.Project.Module`** - Creating and managing modules with proper file placement
+2422 |- **`Igniter.Project.TaskAliases`** - Managing task aliases in mix.exs
+2423 |- **`Igniter.Project.Test`** - Working with test and test support files
+2424 |
+2425 |### Code-Level Modules (`Igniter.Code.*`)
+2426 |
+2427 |- **`Igniter.Code.Common`** - General purpose utilities for working with Sourceror.Zipper
+2428 |- **`Igniter.Code.Function`** - Working with function definitions and calls
+2429 |- **`Igniter.Code.Keyword`** - Manipulating keyword lists
+2430 |- **`Igniter.Code.List`** - Working with lists in AST
+2431 |- **`Igniter.Code.Map`** - Manipulating maps
+2432 |- **`Igniter.Code.Module`** - Working with module definitions and usage
+2433 |- **`Igniter.Code.String`** - Utilities for string literals
+2434 |- **`Igniter.Code.Tuple`** - Working with tuples
+2435 |
+2436 |<-- igniter-end -->
+2437 |<-- usage-rules-end -->
+
