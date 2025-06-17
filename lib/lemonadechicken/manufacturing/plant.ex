@@ -56,7 +56,9 @@ defmodule Lemonadechicken.Manufacturing.Plant do
     end
 
     calculate :has_active_runs, :boolean do
-      fn plant, _, _ ->
+      load :areas
+      load [areas: [lines: [:production_runs]]]
+      calculation fn plant, _args ->
         case plant.areas do
           nil -> false
           areas ->
