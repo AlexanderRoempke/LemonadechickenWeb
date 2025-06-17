@@ -166,7 +166,7 @@ defmodule Lemonadechicken.Manufacturing.Machine do
             nil -> nil
             id ->
               Lemonadechicken.Manufacturing.TimeTracker
-              |> Ash.Query.filter(machine_id == ^id and is_nil(end_time))
+              |> Ash.Query.filter(machine_id == id and is_nil(end_time))
               |> Ash.Query.sort(start_time: :desc)
               |> Ash.Query.limit(1)
               |> Lemonadechicken.read_one()

@@ -55,7 +55,7 @@ defmodule Lemonadechicken.Manufacturing.Line do
   calculations do
     calculate :machine_count, :integer do
       load :machines
-      fn line, _, _ ->
+      calculation fn line, _args ->
         case line.machines do
           nil -> 0
           machines -> length(machines)
@@ -65,7 +65,7 @@ defmodule Lemonadechicken.Manufacturing.Line do
 
     calculate :active_machines, :integer do
       load :machines
-      fn line, _, _ ->
+      calculation fn line, _args ->
         case line.machines do
           nil -> 0
           machines -> Enum.count(machines, & &1.active)
@@ -75,7 +75,7 @@ defmodule Lemonadechicken.Manufacturing.Line do
 
     calculate :active_run, :struct do
       load :production_runs
-      fn line, _, _ ->
+      calculation fn line, _args ->
         case line.production_runs do
           nil -> nil
           [] -> nil
@@ -88,8 +88,8 @@ defmodule Lemonadechicken.Manufacturing.Line do
     end
 
     calculate :average_efficiency, :float do
-      load [production_runs: :machine]
-      fn line, _, _ ->
+      load :production_runs
+      calculation fn line, _args ->
         case line.production_runs do
           nil -> 0.0
           [] -> 0.0
